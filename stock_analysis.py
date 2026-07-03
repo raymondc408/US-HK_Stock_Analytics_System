@@ -2,187 +2,217 @@ import streamlit as st
 import yfinance as yf
 import pandas as pd
 import numpy as np
-from datetime import datetime
+from datetime import datetime, timedelta
 import io
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 
-# --- 語系設定數據 ---
-LANG_DICT = {
-    "中文": {
-        "title": "🚀 美港股五維度量化分析系統",
-        "subtitle": "本系統採用：趨勢、估值、量能、動能、波動 五大維度即時評分。",
-        "sidebar_header": "📂 管理監控清單",
-        "add_ticker": "輸入代號:",
-        "add_btn": "新增",
-        "del_header": "選取要刪除的股票:",
-        "del_btn": "刪除選取股票",
-        "run_btn": "🔥 開始即時量化分析",
-        "table_header": "📊 量化決策清單 (按分數排名)",
-        "download_btn": "📥 下載完整 Excel 報告",
-        "logic_header": "📝 點擊查看量化評分詳情說明",
-        "logic_content": "- **趨勢**: 越接近 50MA 分數越高。\n- **估值**: PEG < 1.2 為理想區。\n- **動能**: RVOL 與 1W/1M 資金趨勢。\n- **指標**: RSI 45-65 為強勢區。\n- **波動**: ATR 佔比越低得分越高。",
-        "cols": {
-            "Rank": "排名", "Ticker": "代號", "Name": "名稱", "Score": "量化總分", "Action": "交易決策",
-            "Price": "現價", "Buy": "建議買入價(50MA)", "SL": "建議止損價", "TP": "建議止盈價",
-            "ATR_pct": "ATR佔比%", "RVOL": "相對量(RVOL)", "V_Trend": "量能趨勢(1w/1m)", "RSI": "RSI(14)", "PEG": "PEG"
-        }
-    },
-    "English": {
-        "title": "🚀 US/HK Multi-Factor Quant System",
-        "subtitle": "Analysis based on: Trend, Value, Volume, Momentum, and Volatility.",
-        "sidebar_header": "📂 Manage Watchlist",
-        "add_ticker": "Enter Ticker:",
-        "add_btn": "Add",
-        "del_header": "Select Tickers to Remove:",
-        "del_btn": "Remove Selected",
-        "run_btn": "🔥 Start Quant Analysis",
-        "table_header": "📊 Quant Decision List (Ranked by Score)",
-        "download_btn": "📥 Download Excel Report",
-        "logic_header": "📝 Click to view Scoring Logic",
-        "logic_content": "- **Trend**: Score is higher when price is near 50MA.\n- **Value**: PEG < 1.2 is ideal.\n- **Volume**: Analysis of RVOL and 1W/1M Trends.\n- **Momentum**: RSI 45-65 is the spot.\n- **Volatility**: Lower ATR% scores higher (stability).",
-        "cols": {
-            "Rank": "Rank", "Ticker": "Ticker", "Name": "Name", "Score": "Quant Score", "Action": "Action",
-            "Price": "Price", "Buy": "Buy Price(50MA)", "SL": "Stop Loss", "TP": "Take Profit",
-            "ATR_pct": "ATR%", "RVOL": "RVOL", "V_Trend": "Vol Trend(1w/1m)", "RSI": "RSI(14)", "PEG": "PEG"
-        }
+# --- 0. 基礎配置與 CSS 注入 ---
+st.set_page_config(page_title="Quant Dual Lab v6.18 Pro", layout="wide")
+
+# CSS 強制單元格與表頭置中，對齊說明框高度
+st.markdown("""
+    <style>
+    div[data-testid="stDataFrame"] td { text-align: center !important; vertical-align: middle !important; }
+    div[data-testid="stDataFrame"] th { text-align: center !important; vertical-align: middle !important; line-height: 1.5 !important; }
+    .stMetric { text-align: center !important; }
+    
+    .model-info-container {
+        min-height: 400px; 
+        background-color: #f8f9fb;
+        padding: 20px;
+        border-radius: 10px;
+        border-left: 5px solid #1E3A5F;
+        margin-bottom: 20px;
+        line-height: 1.6;
     }
-}
+    </style>
+    """, unsafe_allow_html=True)
 
-# --- 核心量化算法 ---
+# 初始化 Session State
+if 'tickers' not in st.session_state:
+    st.session_state.tickers = ['VOO', 'QQQ', 'NVDA', 'AAPL', 'TSLA', '1919.HK', '0941.HK', '0005.HK']
+if 'res_614' not in st.session_state: st.session_state.res_614 = None
+if 'res_cd' not in st.session_state: st.session_state.res_cd = None
+if 'df_dict_614' not in st.session_state: st.session_state.df_dict_614 = {}
+if 'df_dict_cd' not in st.session_state: st.session_state.df_dict_cd = {}
+
+# --- 核心計算函數 ---
 def calculate_rsi(data, window=14):
     delta = data.diff()
     gain = (delta.where(delta > 0, 0)).rolling(window=window).mean()
     loss = (-delta.where(delta < 0, 0)).rolling(window=window).mean()
-    rs = gain / loss
-    return 100 - (100 / (1 + rs))
+    return 100 - (100 / (1 + gain / (loss + 1e-9)))
 
-def calculate_atr(data_high, data_low, data_close, window=14):
-    high_low = data_high - data_low
-    high_close = np.abs(data_high - data_close.shift())
-    low_close = np.abs(data_low - data_close.shift())
-    ranges = pd.concat([high_low, high_close, low_close], axis=1)
-    true_range = np.max(ranges, axis=1)
-    return true_range.rolling(window=window).mean()
+def calculate_atr(df, window=14):
+    h_l, h_c = df['High'] - df['Low'], np.abs(df['High'] - df['Close'].shift())
+    l_c = np.abs(df['Low'] - df['Close'].shift())
+    return pd.concat([h_l, h_c, l_c], axis=1).max(axis=1).rolling(window=window).mean()
 
-def run_quant_analysis(tickers, lang):
-    analysis_list = []
-    progress_bar = st.progress(0)
-    
-    for i, ticker_symbol in enumerate(tickers):
+def min_max_normalize(series, inverse=False):
+    s = pd.to_numeric(series, errors='coerce').fillna(series.median() if not series.empty else 0)
+    if s.max() == s.min(): return s * 0 + 50
+    norm = (s - s.min()) / (s.max() - s.min()) * 100
+    return (100 - norm) if inverse else norm
+
+def calculate_dca_multiplier(df, months_interval):
+    d_df = df.copy()
+    dca_dates = d_df.resample(f'{months_interval}MS').first().index
+    actual = [d for d in dca_dates if d in d_df.index]
+    if d_df.index[0] not in actual: actual.insert(0, d_df.index[0])
+    d_df['Cash'] = 0.0
+    d_df.loc[actual, 'Cash'] = 1000.0
+    cum_cash = d_df['Cash'].cumsum()
+    shares = (d_df['Cash'] / d_df['Close']).cumsum()
+    res = (shares * d_df['Close']) / cum_cash.replace(0, np.nan)
+    return res.ffill().fillna(1.0)
+
+# --- 績效表配置 ---
+PERF_COL_CFG = {
+    "策:最終倍數": st.column_config.NumberColumn("策:最終倍數", format="%.2fx"),
+    "策:年度回報": st.column_config.NumberColumn("策:年度回報", format="%.2f%%"),
+    "策:交易次數": st.column_config.NumberColumn("策:交易次數", format="%d"),
+    "平:最終倍數": st.column_config.NumberColumn("平:最終倍數", format="%.2fx"),
+    "平:年度回報": st.column_config.NumberColumn("平:年度回報", format="%.2f%%")
+}
+
+def style_perf_df(df):
+    return df.style.set_properties(**{'text-align': 'center'}) \
+                   .map(lambda x: 'background-color: #E6F3FF', subset=[c for c in df.columns if "策:" in c]) \
+                   .map(lambda x: 'background-color: #FFF4E6', subset=[c for c in df.columns if "平:" in c])
+
+# --- 1. Model v6.14 分析引擎 ---
+def run_analysis_614(tickers):
+    res = []
+    bar_space = st.empty()
+    prog = bar_space.progress(0)
+    for i, t in enumerate(tickers):
         try:
-            stock = yf.Ticker(ticker_symbol)
-            hist = stock.history(period="10mo")
-            
-            # --- 重要修正：過濾掉空數據 (解決港股 None 問題) ---
-            hist = hist.dropna(subset=['Close'])
-            
-            if len(hist) < 60: continue
+            s = yf.Ticker(t); h = s.history(period="1y").dropna()
+            if h.empty: continue
+            cp, ma50 = h['Close'].iloc[-1], h['Close'].rolling(min(len(h), 50)).mean().iloc[-1]
+            rsi, atr = calculate_rsi(h['Close']).iloc[-1], calculate_atr(h).iloc[-1]
+            peg = s.info.get('pegRatio')
+            is_g = peg is None or np.isnan(float(peg))
+            w = [0.30, 0.20, 0.20, 0.15, 0.15] if not is_g else [0.45, 0.00, 0.25, 0.15, 0.15]
+            s_t, s_p = max(0, 100-(abs(cp-ma50)/ma50*500)), 100 if (not is_g and peg < 1.2) else (max(0, 100-(peg-1.2)*40) if not is_g else 0)
+            v_t, v_1w, v_1m = h['Volume'].iloc[-1], h['Volume'].tail(5).mean(), h['Volume'].tail(21).mean()
+            rvol, v_trend = v_t/(v_1w+1e-9), v_1w/(v_1m+1e-9)
+            score = (s_t*w[0])+(s_p*w[1])+(min(50,(rvol/1.5)*25)+min(50,(v_trend/1.2)*40))*w[2]+(100 if 45<=rsi<=65 else 50)*w[3]+max(0, 100-((atr/cp)*1500))*w[4]
+            res.append({"Ticker": t, "Name": s.info.get('shortName', t), "Score": round(score, 1), "Action": "★建議買入" if score >= 65 else "觀望", "Price": round(cp, 2), "買入價(50MA)": round(ma50, 2), "止損價": round(cp-2*atr, 2), "止盈價": round(cp+3*atr, 2), "RSI": round(rsi, 1), "ATR%": f"{round((atr/cp)*100,2)}%"})
+        except: pass
+        prog.progress((i+1)/len(tickers))
+    bar_space.empty()
+    return pd.DataFrame(res).sort_values("Score", ascending=False).reset_index(drop=True)
 
-            info = stock.info
-            current_price = hist['Close'].iloc[-1]
-            prev_close = hist['Close'].iloc[-2]
-            ma50 = hist['Close'].rolling(window=50).mean().iloc[-1]
-            rsi = calculate_rsi(hist['Close']).iloc[-1]
-            atr = calculate_atr(hist['High'], hist['Low'], hist['Close']).iloc[-1]
-            atr_pct = (atr / current_price) * 100
-            
-            peg = info.get('pegRatio')
-            is_generic = peg is None or np.isnan(float(peg))
-            
-            w = [0.30, 0.20, 0.20, 0.15, 0.15] if not is_generic else [0.45, 0.00, 0.25, 0.15, 0.15]
-            s_trend = max(0, 100 - (abs(current_price - ma50) / ma50 * 500))
-            s_peg = 100 if (not is_generic and peg < 1.2) else (max(0, 100 - (peg - 1.2) * 40) if not is_generic else 0)
-            
-            vol_today = hist['Volume'].iloc[-1]
-            vol_avg_1w = hist['Volume'].tail(5).mean()
-            vol_avg_1m = hist['Volume'].tail(21).mean()
-            rvol, vol_trend = vol_today / vol_avg_1w, vol_avg_1w / vol_avg_1m
-            
-            s_vol = (min(50, (rvol/1.5)*25) + min(50, (vol_trend/1.2)*40))
-            if current_price > prev_close and vol_today < vol_avg_1w: s_vol *= 0.8
-            s_rsi = 100 if 45 <= rsi <= 65 else (10 if rsi > 75 else 50)
-            s_atr = max(0, 100 - (atr_pct * 15)) if atr_pct > 1.5 else 100
+# --- 2. Model CD v6.15 分析引擎 ---
+def run_analysis_cd(tickers):
+    raw = []
+    bar_space = st.empty()
+    prog = bar_space.progress(0)
+    for i, t in enumerate(tickers):
+        try:
+            s = yf.Ticker(t); h = s.history(period="2y").dropna()
+            inf = s.info
+            raw.append({"Ticker": t, "Name": inf.get('shortName', t), "PE": inf.get('trailingPE', np.nan), "PB": inf.get('priceToBook', np.nan), "ROE": inf.get('returnOnEquity', 0), "Margin": inf.get('profitMargins', 0), "Debt": inf.get('debtToEquity', 100), "RevGrow": inf.get('revenueGrowth', 0), "FCF": inf.get('freeCashflow', 0), "Price": h['Close'].iloc[-1], "hist": h})
+        except: pass
+        prog.progress((i + 1) / len(tickers))
+    bar_space.empty()
+    if not raw: return pd.DataFrame()
+    df_r = pd.DataFrame(raw)
+    v_s, p_s, h_s, g_s = (min_max_normalize(df_r['PE'], True) + min_max_normalize(df_r['PB'], True)) / 2, (min_max_normalize(df_r['ROE']) + min_max_normalize(df_r['Margin'])) / 2, (min_max_normalize(df_r['Debt'], True) + df_r['FCF'].apply(lambda x: 100 if x > 0 else 0)) / 2, min_max_normalize(df_r['RevGrow'])
+    df_r['F_Score'] = (v_s * 0.30 + p_s * 0.35 + h_s * 0.20 + g_s * 0.15)
+    final = []
+    for _, r in df_r.iterrows():
+        fv = r['F_Score']
+        if fv >= 65:
+            h = r['hist']; cp = h['Close'].iloc[-1]; ma200, ma50 = h['Close'].rolling(min(len(h), 200)).mean().iloc[-1], h['Close'].rolling(min(len(h), 50)).mean().iloc[-1]
+            atr_v = calculate_atr(h).iloc[-1]
+            ts = (2 if cp > ma200 else 0) + (2 if cp > ma50 else 0) + (2 if h['Volume'].iloc[-1] > h['Volume'].tail(20).mean()*1.5 else 0)
+            dec = "✅ 積極買入" if ts >= 6 else ("△ 分批建倉" if ts >= 4 else "⏳ 觀察")
+            final.append({"Ticker": r['Ticker'], "F_Score": round(fv, 1), "T_Score": ts, "Action": dec, "Price": round(r['Price'], 2), "買入價(50MA)": round(ma50, 2), "止損價": round(cp-2*atr_v, 2), "止盈價": round(cp+3*atr_v, 2)})
+        else:
+            final.append({"Ticker": r['Ticker'], "F_Score": round(fv, 1), "T_Score": "N/A", "Action": "X 淘汰", "Price": round(r['Price'], 2), "買入價(50MA)": "N/A", "止損價": "N/A", "止盈價": "N/A"})
+    return pd.DataFrame(final).sort_values("F_Score", ascending=False).reset_index(drop=True)
 
-            final_score = (s_trend * w[0]) + (s_peg * w[1]) + (s_vol * w[2]) + (s_rsi * w[3]) + (s_atr * w[4])
-            
-            if lang == "中文":
-                action = "★強烈建議買入" if final_score >= 82 else ("☆建議買入" if final_score >= 65 else ("建議減碼" if final_score < 40 else "觀望"))
-            else:
-                action = "★Strong Buy" if final_score >= 82 else ("☆Buy" if final_score >= 65 else ("Reduce" if final_score < 40 else "Wait"))
-
-            analysis_list.append({
-                "Ticker": ticker_symbol,
-                "Name": info.get('longName', 'N/A'),
-                "Score": round(final_score, 1),
-                "Action": action,
-                "Price": round(current_price, 2),
-                "Buy": round(ma50, 2),
-                "SL": round(current_price - 2*atr, 2),
-                "TP": round(current_price + 3*atr, 2),
-                "ATR_pct": f"{round(atr_pct, 2)}%",
-                "RVOL": round(rvol, 2),
-                "V_Trend": round(vol_trend, 2),
-                "RSI": round(rsi, 1),
-                "PEG": round(peg, 2) if not is_generic else "N/A"
-            })
-        except Exception as e:
-            pass # 忽略抓不到數據的單個股票
-        progress_bar.progress((i + 1) / len(tickers))
-    return pd.DataFrame(analysis_list)
-
-# --- Streamlit UI ---
-st.set_page_config(page_title="Quant System", layout="wide")
-
-if 'lang' not in st.session_state: st.session_state.lang = "中文"
+# --- 側邊欄：清單管理 ---
 with st.sidebar:
-    lang_choice = st.radio("🌐 Language / 語系", ["中文", "English"], horizontal=True)
-    st.session_state.lang = lang_choice
-
-L = LANG_DICT[st.session_state.lang]
-st.title(L["title"])
-st.markdown(L["subtitle"])
-
-if 'tickers' not in st.session_state:
-    st.session_state.tickers = [
-        'SOXX', 'MAGS', 'RKLB', 'NLR', 'COIN', 'GLD', 
-        '1919.HK', '0293.HK', '0992.HK', '0316.HK', '1088.HK', 
-        '0941.HK', '0005.HK', '0522.HK', '3988.HK', '9961.HK', 
-        '0001.HK', 'AMD', 'ASML', 'BTC-USD', 'COST', '^SOX', 'TSM',
-        'NVDA', 'AAPL', 'GOOGL', 'TSLA', 'QQQ', 'VOO', 'BRK-B', 'XLC'
-    ]
-
-with st.sidebar:
-    st.header(L["sidebar_header"])
-    new_ticker = st.text_input(L["add_ticker"]).upper()
-    if st.button(L["add_btn"]):
-        if new_ticker and new_ticker not in st.session_state.tickers:
-            st.session_state.tickers.append(new_ticker)
-            st.rerun()
+    st.title("📂 清單管理中心")
+    up_file = st.file_uploader("1. 導入股票文件 (.txt)", type=["txt"])
+    if up_file and st.button("📥 確認導入"):
+        new_list = [line.strip().upper() for line in up_file.getvalue().decode("utf-8").splitlines() if line.strip()]
+        st.session_state.tickers = list(set(st.session_state.tickers + new_list)); st.rerun()
+    man_t = st.text_input("2. 手動新增代號:").upper()
+    if st.button("Add Manual"):
+        if man_t and man_t not in st.session_state.tickers: st.session_state.tickers.append(man_t); st.rerun()
     st.write("---")
-    to_remove = st.multiselect(L["del_header"], st.session_state.tickers)
-    if st.button(L["del_btn"]):
-        st.session_state.tickers = [t for t in st.session_state.tickers if t not in to_remove]
-        st.rerun()
-    st.info(f"當前監控數: {len(st.session_state.tickers)}")
+    st.subheader(f"📋 目前清單 (共 {len(st.session_state.tickers)} 隻):")
+    st.info(", ".join(st.session_state.tickers))
+    if st.session_state.tickers:
+        st.download_button(label="📤 匯出目前清單 (.txt)", data="\n".join(st.session_state.tickers), file_name="tickers.txt", mime="text/plain")
+    if st.button("⚠️ Clear All"): st.session_state.tickers = []; st.rerun()
 
-if st.button(L["run_btn"], type="primary"):
-    results = run_quant_analysis(st.session_state.tickers, st.session_state.lang)
-    if not results.empty:
-        results = results.sort_values(by="Score", ascending=False).reset_index(drop=True)
-        results.index += 1
-        results.insert(0, 'Rank', results.index)
+# --- 主介面 ---
+st.title("🔬 量化對照實驗室 v6.18 Final Pro")
+col_l, col_r = st.columns(2)
 
-        st.subheader(L["table_header"])
-        display_df = results.rename(columns=L["cols"])
-        
-        st.dataframe(
-            display_df.style.map(lambda v: 'background-color: #C6EFCE; color: #006100' if ('建議買入' in str(v) or 'Buy' in str(v)) else '', subset=[L["cols"]["Action"]]),
-            use_container_width=True, height=800, hide_index=True
-        )
+# --- LEFT: Strategy Model 綜合加權分析 ---
+with col_l:
+    st.subheader("🟢 Strategy Model: 綜合加權分析")
+    st.markdown("""<div class="model-info-container"><b>模型詳細說明：</b><br>本模型採用多因子加權評分制，對市場動能與趨勢極為敏感。<br><br><ul><li><b>趨勢 (30%)</b>: 股價相對於50MA的偏離度。回踩支撐 ±2% 得分最高。</li><li><b>估值 (20%)</b>: PEG比率，尋找增長與價格的平衡。</li><li><b>量能 (20%)</b>: 今日相對量(RVOL)與週/月成交趨勢。</li><li><b>指標 (15%)</b>: RSI 強勢區間(45-65)判定。</li><li><b>波動 (15%)</b>: ATR佔比，優先選擇低波動穩健標的。</li></ul><i>*註：ETF模式下估值權重會自動轉移至趨勢(45%)與量能(25%)。</i></div>""", unsafe_allow_html=True)
+    if st.button("🔥 執行分析", key="r14"):
+        st.session_state.res_614 = run_analysis_614(st.session_state.tickers)
+    if st.session_state.res_614 is not None:
+        d = st.session_state.res_614.copy(); d.index += 1; d.insert(0, 'Rank', d.index)
+        st.dataframe(d.style.set_properties(**{'text-align': 'center'}).map(lambda v: 'background-color: #C6EFCE' if '建議' in str(v) else '', subset=['Action']), use_container_width=True, hide_index=True)
+    
+    st.write("---")
+    st.markdown("#### 🏆 投資法績效對照 (v6.14)")
+    tks14 = st.multiselect("回測代號:", st.session_state.tickers, key="tks14")
+    yr14 = st.selectbox("年期:", [1, 2, 3, 5, 10, 20, 30], index=2, key="yr14")
+    dca14 = st.selectbox("DCA 頻率:", [1, 2, 3, 6, 12], index=0, format_func=lambda x: f"每 {x} 個月", key="d14")
+    if st.button("🚀 開始回測", key="bt14") and tks14:
+        st.session_state.df_dict_614 = {}
+        for t in tks14:
+            df_dl = yf.download(t, start=datetime.now()-timedelta(days=yr14*365+150), end=datetime.now(), progress=False)
+            if not df_dl.empty:
+                df_dl.columns = [c[0] if isinstance(c, tuple) else c for c in df_dl.columns]
+                st.session_state.df_dict_614[t] = {"df": df_dl.dropna(subset=['Close']), "name": yf.Ticker(t).info.get('shortName', t)}
+    if st.session_state.df_dict_614:
+        sm = []
+        for t, data in st.session_state.df_dict_614.items():
+            df = data["df"]; ma = df['Close'].rolling(min(len(df), 50)).mean(); score = (100-(abs(df['Close']-ma)/ma*500)).clip(0,100)
+            sig = (score >= 65).astype(int).shift(1).fillna(0); strat_y = (1 + df['Close'].pct_change() * sig).cumprod(); dca_y = calculate_dca_multiplier(df, dca14)
+            sm.append({"代號": t, "策:最終倍數": strat_y.iloc[-1], "策:年度回報": (strat_y.iloc[-1]**(1/yr14)-1)*100, "策:交易次數": int(sig.diff().abs().sum()), "平:最終倍數": dca_y.iloc[-1], "平:年度回報": (dca_y.iloc[-1]**(1/yr14)-1)*100})
+        st.dataframe(style_perf_df(pd.DataFrame(sm)), use_container_width=True, hide_index=True, column_config=PERF_COL_CFG)
+        st.caption("Remark: 策 = 策略投資法 | 平 = 平衡投資法 (DCA)")
 
-        output = io.BytesIO()
-        with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
-            display_df.to_excel(writer, index=False, sheet_name='Quant Analysis')
-        st.download_button(L["download_btn"], output.getvalue(), f"Quant_{datetime.now().strftime('%Y%m%d')}.xlsx")
-
-with st.expander(L["logic_header"]):
-    st.write(L["logic_content"])
+# --- RIGHT: Strategy Model 基本和技術分析 ---
+with col_r:
+    st.subheader("🔵 Strategy Model: 基本和技術分析")
+    st.markdown("""<div class="model-info-container"><b>二階段選股邏輯說明：</b><br>本模型結合基本面深度篩選與技術面強勢擇時，追求高品質交易。<br><br>1. <b>第一階段 (基本面 F-Score)</b>:<br>&nbsp;&nbsp;&nbsp;◦ 計算 估值(30%) + 盈利(35%) + 財務(20%) + 成長(15%)。<br>&nbsp;&nbsp;&nbsp;◦ 門檻：F-Score ≧ 65分合格，未達標則直接淘汰。<br><br>2. <b>第二階段 (技術面 T-Score)</b>:<br>&nbsp;&nbsp;&nbsp;◦ 針對合格股進行技術打分 (滿分 8分)。<br>&nbsp;&nbsp;&nbsp;◦ 包含 200MA位置、均線排列、成交量爆發。<br>&nbsp;&nbsp;&nbsp;◦ 決策：6分以上積極買入 / 4分分批建倉。</div>""", unsafe_allow_html=True)
+    if st.button("🚀 執行 CD 分析", key="rcd"):
+        st.session_state.res_cd = run_analysis_cd(st.session_state.tickers)
+    if st.session_state.res_cd is not None:
+        d = st.session_state.res_cd.copy(); d.index += 1; d.insert(0, 'Rank', d.index)
+        st.dataframe(d.style.set_properties(**{'text-align': 'center'}).map(lambda v: 'background-color: #C6EFCE' if '積極' in str(v) else ('background-color: #FFC7CE' if '淘汰' in str(v) else ''), subset=['Action']), use_container_width=True, hide_index=True)
+    
+    st.write("---")
+    tks_cd = st.multiselect("回測代號 (CD):", st.session_state.tickers, key="tks_cd")
+    yrcd = st.selectbox("年期:", [1, 2, 3, 5, 10, 20, 30], index=2, key="yrcd")
+    dcacd = st.selectbox("DCA 頻率:", [1, 2, 3, 6, 12], index=0, format_func=lambda x: f"每 {x} 個月", key="dcd")
+    if st.button("🚀 開始 CD 回測", key="btcd") and tks_cd:
+        st.session_state.df_dict_cd = {}
+        for t in tks_cd:
+            df_dl = yf.download(t, start=datetime.now()-timedelta(days=yrcd*365+150), end=datetime.now(), progress=False)
+            if not df_dl.empty:
+                df_dl.columns = [c[0] if isinstance(c, tuple) else c for c in df_dl.columns]
+                st.session_state.df_dict_cd[t] = {"df": df_dl.dropna(subset=['Close']), "name": yf.Ticker(t).info.get('shortName', t)}
+    if st.session_state.df_dict_cd:
+        sm = []
+        for t, data in st.session_state.df_dict_cd.items():
+            df = data["df"]; ma = df['Close'].rolling(min(len(df), 50)).mean(); score = (100-(abs(df['Close']-ma)/ma*500)).clip(0,100)
+            sig = (score >= 70).astype(int).shift(1).fillna(0); strat_y = (1 + df['Close'].pct_change() * sig).cumprod(); dca_y = calculate_dca_multiplier(df, dcacd)
+            sm.append({"代號": t, "策:最終倍數": strat_y.iloc[-1], "策:年度回報": (strat_y.iloc[-1]**(1/yrcd)-1)*100, "策:交易次數": int(sig.diff().abs().sum()), "平:最終倍數": dca_y.iloc[-1], "平:年度回報": (dca_y.iloc[-1]**(1/yrcd)-1)*100})
+        st.dataframe(style_perf_df(pd.DataFrame(sm)), use_container_width=True, hide_index=True, column_config=PERF_COL_CFG)
+        st.caption("Remark: 策 = 策略投資法 | 平 = 平衡投資法 (DCA)")
