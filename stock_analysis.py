@@ -225,4 +225,6 @@ with col_r:
             df = data["df"]; ma = df['Close'].rolling(min(len(df), 50)).mean(); score = (100-(abs(df['Close']-ma)/ma*500)).clip(0,100)
             sig = (score >= 70).astype(int).shift(1).fillna(0)
             strat_y, dca_y = (1+df['Close'].pct_change()*sig).cumprod(), calculate_dca_multiplier(df, dcacd)
-            sm_cd.append({"代號": t, "策:最終倍數": strat_y.iloc[-1], "策:年度回報": (strat_y.iloc[-1]**(1/yrcd)-
+            sm_cd.append({"代號": t, "策:最終倍數": strat_y.iloc[-1], "策:年度回報": (strat_y.iloc[-1]**(1/yrcd)-1)*100, "策:交易次數": int(sig.diff().abs().sum()), "平:最終倍數": dca_y.iloc[-1], "平:年度回報": (dca_y.iloc[-1]**(1/yrcd)-1)*100})
+        st.dataframe(style_center_df(pd.DataFrame(sm_cd)), use_container_width=True, hide_index=True, column_config=PERF_COL_CFG)
+        st.caption("Remark: 策 = 策略投資法 | 平 = 平衡投資法 (DCA)")
