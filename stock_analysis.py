@@ -10,11 +10,10 @@ from plotly.subplots import make_subplots
 # --- 0. 基礎配置與 CSS 注入 ---
 st.set_page_config(page_title="Quant Dual Lab v6.18 Pro", layout="wide")
 
-# CSS 強制置中、對齊框高度、縮減留白
 st.markdown("""
     <style>
     div[data-testid="stDataFrame"] td { text-align: center !important; vertical-align: middle !important; }
-    div[data-testid="stDataFrame"] th { text-align: center !important; vertical-align: middle !important; line-height: 1.2 !important; }
+    div[data-testid="stDataFrame"] th { text-align: center !important; vertical-align: middle !important; line-height: 1.5 !important; }
     .stMetric { text-align: center !important; }
     
     .model-info-container {
@@ -69,7 +68,6 @@ def calculate_dca_multiplier(df, months_interval):
     res = (shares * d_df['Close']) / cum_cash.replace(0, np.nan)
     return res.ffill().fillna(1.0)
 
-# --- 績效表格樣式定義 ---
 PERF_COL_CFG = {
     "策:最終倍數": st.column_config.NumberColumn("策:最終倍數", format="%.2fx"),
     "策:年度回報": st.column_config.NumberColumn("策:年度回報", format="%.2f%%"),
@@ -83,10 +81,10 @@ def style_center_df(df):
                    .map(lambda x: 'background-color: #E6F3FF', subset=[c for c in df.columns if "策:" in c]) \
                    .map(lambda x: 'background-color: #FFF4E6', subset=[c for c in df.columns if "平:" in c])
 
-# --- 1. Model v6.14 分析引擎 ---
+# --- 1. DMW-6.14 分析 ---
 def run_analysis_614(tickers):
     res = []
-    bar = st.empty(); prog = bar.progress(0)
+    bar_space = st.empty(); prog = bar_space.progress(0)
     for i, t in enumerate(tickers):
         try:
             s = yf.Ticker(t); h = s.history(period="1y").dropna()
@@ -110,21 +108,23 @@ def run_analysis_614(tickers):
             })
         except: pass
         prog.progress((i+1)/len(tickers))
-    bar.empty()
-    return pd.DataFrame(res).sort_values("Score", ascending=False).reset_index(drop=True)
+    bar_space.empty()
+    df_out = pd.DataFrame(res)
+    if df_out.empty: return df_out
+    return df_out.sort_values("Score", ascending=False).reset_index(drop=True)
 
-# --- 2. Model CD v6.15 分析引擎 ---
+# --- 2. CD-6.15 分析 ---
 def run_analysis_cd(tickers):
     raw_list = []
-    bar = st.empty(); prog = bar.progress(0)
+    bar_space = st.empty(); prog = bar_space.progress(0)
     for i, t in enumerate(tickers):
         try:
             s = yf.Ticker(t); h = s.history(period="2y").dropna()
             inf = s.info
-            raw_list.append({"Ticker": t, "PE": inf.get('trailingPE', np.nan), "ROE": inf.get('returnOnEquity', 0), "Margin": inf.get('profitMargins', 0), "Debt": inf.get('debtToEquity', 100), "RevGrow": inf.get('revenueGrowth', 0), "FCF": inf.get('freeCashflow', 0), "Price": h['Close'].iloc[-1], "hist": h})
+            raw_list.append({"Ticker": t, "Name": inf.get('shortName', t), "PE": inf.get('trailingPE', np.nan), "ROE": inf.get('returnOnEquity', 0), "Margin": inf.get('profitMargins', 0), "Debt": inf.get('debtToEquity', 100), "RevGrow": inf.get('revenueGrowth', 0), "FCF": inf.get('freeCashflow', 0), "Price": h['Close'].iloc[-1], "hist": h})
         except: pass
         prog.progress((i + 1) / len(tickers))
-    bar.empty()
+    bar_space.empty()
     if not raw_list: return pd.DataFrame()
     df_r = pd.DataFrame(raw_list)
     v_s, p_s, h_s, g_s = min_max_normalize(df_r['PE'], True), (min_max_normalize(df_r['ROE']) + min_max_normalize(df_r['Margin'])) / 2, (min_max_normalize(df_r['Debt'], True) + df_r['FCF'].apply(lambda x: 100 if x > 0 else 0)) / 2, min_max_normalize(df_r['RevGrow'])
@@ -133,21 +133,24 @@ def run_analysis_cd(tickers):
     for _, r in df_r.iterrows():
         fv = r['F_Score']
         if fv >= 65:
-            h = r['hist']; cp = h['Close'].iloc[-1]; ma200, ma50 = h['Close'].rolling(min(len(h), 200)).mean().iloc[-1], h['Close'].rolling(min(len(h), 50)).mean().iloc[-1]
-            atr_v = calculate_atr(h).iloc[-1]
+            h = r['hist']; cp = h['Close'].iloc[-1]; ma50 = h['Close'].rolling(min(len(h), 50)).mean().iloc[-1]
+            ma200 = h['Close'].rolling(min(len(h), 200)).mean().iloc[-1]; atr_v = calculate_atr(h).iloc[-1]
             ts = (2 if cp > ma200 else 0) + (2 if cp > ma50 else 0) + (2 if h['Volume'].iloc[-1] > h['Volume'].tail(20).mean()*1.5 else 0)
             dec = "✅ 積極買入" if ts >= 6 else ("△ 分批建倉" if ts >= 4 else "⏳ 觀察")
             buy_p, sl_p, tp_p = ma50, cp - 2*atr_v, cp + 3*atr_v
         else: ts, dec, buy_p, sl_p, tp_p = "N/A", "X 淘汰", "N/A", "N/A", "N/A"
         final.append({"Ticker": r['Ticker'], "F_Score": round(fv, 1), "T_Score": ts, "Action": dec, "Price": round(r['Price'], 2), "買入價(50MA)": buy_p, "止損價": sl_p, "止盈價": tp_p})
-    return pd.DataFrame(final).sort_values("F_Score", ascending=False).reset_index(drop=True)
+    df_out = pd.DataFrame(final)
+    if df_out.empty: return df_out
+    return df_out.sort_values("F_Score", ascending=False).reset_index(drop=True)
 
 # --- 側邊欄 ---
 with st.sidebar:
     st.title("📂 清單管理中心")
     up_file = st.file_uploader("1. 導入股票文件 (.txt)", type=["txt"])
     if up_file and st.button("📥 確認導入"):
-        st.session_state.tickers = list(set(st.session_state.tickers + [line.strip().upper() for line in up_file.getvalue().decode("utf-8").splitlines() if line.strip()])); st.rerun()
+        new_list = [line.strip().upper() for line in up_file.getvalue().decode("utf-8").splitlines() if line.strip()]
+        st.session_state.tickers = list(set(st.session_state.tickers + new_list)); st.rerun()
     man_t = st.text_input("2. 手動新增代號:").upper()
     if st.button("Add Manual"):
         if man_t and man_t not in st.session_state.tickers: st.session_state.tickers.append(man_t); st.rerun()
@@ -169,16 +172,18 @@ with col_l:
     if st.button("🔥 執行分析", key="r14"):
         st.session_state.res_614 = run_analysis_614(st.session_state.tickers)
     if st.session_state.res_614 is not None:
-        d = st.session_state.res_614.copy(); d.index += 1; d.insert(0, 'Rank', d.index)
-        st.dataframe(d.style.set_properties(**{'text-align': 'center'}).map(lambda v: 'background-color: #C6EFCE' if '建議' in str(v) else '', subset=['Action']), use_container_width=True, hide_index=True)
-    
+        if st.session_state.res_614.empty: st.warning("無法抓取數據，請稍後再試。")
+        else:
+            d = st.session_state.res_614.copy(); d.index += 1; d.insert(0, 'Rank', d.index)
+            st.dataframe(d.style.set_properties(**{'text-align': 'center'}).map(lambda v: 'background-color: #C6EFCE' if '建議' in str(v) else '', subset=['Action']), use_container_width=True, hide_index=True)
     st.write("---")
     st.markdown("#### 🏆 Backtesting for Strategy Model: 綜合加權分析")
-    st.markdown('<div class="backtest-input-block">', unsafe_allow_html=True)
-    tks14 = st.multiselect("回測代號 (加權):", st.session_state.tickers, key="tks14")
-    yr14 = st.selectbox("年期 (加權):", [1, 2, 3, 5, 10, 20, 30], index=2, key="yr14")
-    dca14 = st.selectbox("DCA 頻率 (加權):", [1, 2, 3, 6, 12], index=0, format_func=lambda x: f"每 {x} 個月", key="d14")
-    st.markdown('</div>', unsafe_allow_html=True)
+    with st.container():
+        st.markdown('<div class="backtest-input-block">', unsafe_allow_html=True)
+        tks14 = st.multiselect("回測代號 (加權):", st.session_state.tickers, key="tks14")
+        yr14 = st.selectbox("年期 (加權):", [1, 2, 3, 5, 10, 20, 30], index=2, key="yr14")
+        dca14 = st.selectbox("DCA 頻率 (加權):", [1, 2, 3, 6, 12], index=0, format_func=lambda x: f"每 {x} 個月", key="d14")
+        st.markdown('</div>', unsafe_allow_html=True)
     if st.button("🚀 開始回測 (v6.14)", key="bt14") and tks14:
         st.session_state.df_dict_614 = {}
         for t in tks14:
@@ -199,19 +204,21 @@ with col_l:
 with col_r:
     st.subheader("🔵 Strategy Model: 基本和技術分析")
     st.markdown("""<div class="model-info-container"><b>二階段選股邏輯說明：</b><br>本模型結合基本面深度篩選與技術面強勢擇時，追求高品質交易。<br><br>1. <b>第一階段 (基本面 F-Score)</b>:<br>&nbsp;&nbsp;&nbsp;◦ 計算 估值(30%) + 盈利(35%) + 財務(20%) + 成長(15%)。<br>&nbsp;&nbsp;&nbsp;◦ 門檻：F-Score ≧ 65分合格，未達標則直接淘汰。<br><br>2. <b>第二階段 (技術面 T-Score)</b>:<br>&nbsp;&nbsp;&nbsp;◦ 針對合格股進行技術打分 (滿分 8分)。<br>&nbsp;&nbsp;&nbsp;◦ 包含 200MA位置、均線排列、成交量爆發。<br>&nbsp;&nbsp;&nbsp;◦ 決策：6分以上積極買入 / 4分分批建倉。</div>""", unsafe_allow_html=True)
-    if st.button("🚀 執行 CD 分析", key="rcd"):
+    if st.button("🚀 執行分析", key="rcd"):
         st.session_state.res_cd = run_analysis_cd(st.session_state.tickers)
     if st.session_state.res_cd is not None:
-        d = st.session_state.res_cd.copy(); d.index += 1; d.insert(0, 'Rank', d.index)
-        st.dataframe(d.style.set_properties(**{'text-align': 'center'}).map(lambda v: 'background-color: #C6EFCE' if '積極' in str(v) else ('background-color: #FFC7CE' if '淘汰' in str(v) else ''), subset=['Action']), use_container_width=True, hide_index=True)
-    
+        if st.session_state.res_cd.empty: st.warning("無法抓取基本面數據，請稍後再試。")
+        else:
+            d = st.session_state.res_cd.copy(); d.index += 1; d.insert(0, 'Rank', d.index)
+            st.dataframe(d.style.set_properties(**{'text-align': 'center'}).map(lambda v: 'background-color: #C6EFCE' if '積極' in str(v) else ('background-color: #FFC7CE' if '淘汰' in str(v) else ''), subset=['Action']), use_container_width=True, hide_index=True)
     st.write("---")
     st.markdown("#### 🏆 Backtesting for Strategy Model: 基本和技術分析")
-    st.markdown('<div class="backtest-input-block">', unsafe_allow_html=True)
-    tks_cd = st.multiselect("回測代號 (CD):", st.session_state.tickers, key="tks_cd")
-    yrcd = st.selectbox("年期 (CD):", [1, 2, 3, 5, 10, 20, 30], index=2, key="yrcd")
-    dcacd = st.selectbox("DCA 頻率 (CD):", [1, 2, 3, 6, 12], index=0, format_func=lambda x: f"每 {x} 個月", key="dcd")
-    st.markdown('</div>', unsafe_allow_html=True)
+    with st.container():
+        st.markdown('<div class="backtest-input-block">', unsafe_allow_html=True)
+        tks_cd = st.multiselect("回測代號 (CD):", st.session_state.tickers, key="tks_cd")
+        yrcd = st.selectbox("年期 (CD):", [1, 2, 3, 5, 10, 20, 30], index=2, key="yrcd")
+        dcacd = st.selectbox("DCA 頻率 (CD):", [1, 2, 3, 6, 12], index=0, format_func=lambda x: f"每 {x} 個月", key="dcd")
+        st.markdown('</div>', unsafe_allow_html=True)
     if st.button("🚀 開始 CD 回測", key="btcd") and tks_cd:
         st.session_state.df_dict_cd = {}
         for t in tks_cd:
@@ -223,8 +230,7 @@ with col_r:
         sm_cd = []
         for t, data in st.session_state.df_dict_cd.items():
             df = data["df"]; ma = df['Close'].rolling(min(len(df), 50)).mean(); score = (100-(abs(df['Close']-ma)/ma*500)).clip(0,100)
-            sig = (score >= 70).astype(int).shift(1).fillna(0)
-            strat_y, dca_y = (1+df['Close'].pct_change()*sig).cumprod(), calculate_dca_multiplier(df, dcacd)
+            sig = (score >= 70).astype(int).shift(1).fillna(0); strat_y, dca_y = (1+df['Close'].pct_change()*sig).cumprod(), calculate_dca_multiplier(df, dcacd)
             sm_cd.append({"代號": t, "策:最終倍數": strat_y.iloc[-1], "策:年度回報": (strat_y.iloc[-1]**(1/yrcd)-1)*100, "策:交易次數": int(sig.diff().abs().sum()), "平:最終倍數": dca_y.iloc[-1], "平:年度回報": (dca_y.iloc[-1]**(1/yrcd)-1)*100})
         st.dataframe(style_center_df(pd.DataFrame(sm_cd)), use_container_width=True, hide_index=True, column_config=PERF_COL_CFG)
         st.caption("Remark: 策 = 策略投資法 | 平 = 平衡投資法 (DCA)")
