@@ -6,6 +6,7 @@ from datetime import datetime, timedelta
 import io
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
+import time # 新增：用於控制請求頻率
 
 # --- 0. 基礎配置與 CSS 注入 ---
 st.set_page_config(page_title="Quant Dual Lab v6.18 Pro", layout="wide")
@@ -15,9 +16,8 @@ st.markdown("""
     div[data-testid="stDataFrame"] td { text-align: center !important; vertical-align: middle !important; }
     div[data-testid="stDataFrame"] th { text-align: center !important; vertical-align: middle !important; line-height: 1.5 !important; }
     .stMetric { text-align: center !important; }
-    
     .model-info-container {
-        min-height: 380px; 
+        min-height: 400px; 
         background-color: #f8f9fb;
         padding: 15px;
         border-radius: 10px;
@@ -27,7 +27,6 @@ st.markdown("""
         font-size: 14px;
     }
     .backtest-input-block { min-height: 230px; padding: 5px; margin-bottom: 0px; }
-    .block-container { padding-top: 1.5rem !important; }
     </style>
     """, unsafe_allow_html=True)
 
@@ -81,22 +80,23 @@ def style_center_df(df):
                    .map(lambda x: 'background-color: #E6F3FF', subset=[c for c in df.columns if "策:" in c]) \
                    .map(lambda x: 'background-color: #FFF4E6', subset=[c for c in df.columns if "平:" in c])
 
-# --- 1. DMW-6.14 分析 ---
+# --- 1. Model v6.14 分析引擎 (優化版) ---
 def run_analysis_614(tickers):
     res = []
-    bar_space = st.empty(); prog = bar_space.progress(0)
+    bar = st.empty(); prog = bar.progress(0)
     for i, t in enumerate(tickers):
         try:
             s = yf.Ticker(t); h = s.history(period="1y").dropna()
             if h.empty: continue
-            info = s.info
+            # 雲端防封鎖：只在獲取基本面時調用 info，且加入 try-except
+            try: info = s.info
+            except: info = {}
+            
             cp, ma50 = h['Close'].iloc[-1], h['Close'].rolling(min(len(h), 50)).mean().iloc[-1]
             rsi, atr = calculate_rsi(h['Close']).iloc[-1], calculate_atr(h).iloc[-1]
-            atr_p = (atr / cp) * 100
-            peg = info.get('pegRatio')
-            is_g = peg is None or np.isnan(float(peg))
-            w = [0.30, 0.20, 0.20, 0.15, 0.15] if not is_g else [0.45, 0.00, 0.25, 0.15, 0.15]
-            s_t, s_p = max(0, 100-(abs(cp-ma50)/ma50*500)), 100 if (not is_g and peg < 1.2) else (max(0, 100-(peg-1.2)*40) if not is_g else 0)
+            peg = info.get('pegRatio', np.nan)
+            w = [0.30, 0.20, 0.20, 0.15, 0.15] if not np.isnan(float(peg or np.nan)) else [0.45, 0.00, 0.25, 0.15, 0.15]
+            s_t, s_p = max(0, 100-(abs(cp-ma50)/ma50*500)), 100 if (peg and peg < 1.2) else (max(0, 100-(float(peg or 1.2)-1.2)*40) if peg else 0)
             v_t, v_1w, v_1m = h['Volume'].iloc[-1], h['Volume'].tail(5).mean(), h['Volume'].tail(21).mean()
             s_v = (min(50,(v_t/(v_1w+1e-9)/1.5)*25)+min(50,(v_1w/(v_1m+1e-9)/1.2)*40))
             score = (s_t*w[0])+(s_p*w[1])+(s_v*w[2])+(100 if 45<=rsi<=65 else 50)*w[3]+max(0, 100-((atr/cp)*1500))*w[4]
@@ -104,27 +104,30 @@ def run_analysis_614(tickers):
                 "Ticker": t, "Name": info.get('shortName', t), "Score": round(score, 1), 
                 "Action": "★建議買入" if score >= 65 else "觀望", "Price": round(cp, 2),
                 "買入價(50MA)": round(ma50, 2), "止損價": round(cp-2*atr, 2), 
-                "止盈價": round(cp+3*atr, 2), "RSI": round(rsi, 1), "ATR%": f"{round(atr_p,2)}%"
+                "止盈價": round(cp+3*atr, 2), "RSI": round(rsi, 1), "ATR%": f"{round((atr/cp)*100,2)}%"
             })
+            time.sleep(0.2) # 減少請求頻率
         except: pass
         prog.progress((i+1)/len(tickers))
-    bar_space.empty()
+    bar.empty()
     df_out = pd.DataFrame(res)
-    if df_out.empty: return df_out
-    return df_out.sort_values("Score", ascending=False).reset_index(drop=True)
+    return df_out.sort_values("Score", ascending=False).reset_index(drop=True) if not df_out.empty else df_out
 
-# --- 2. CD-6.15 分析 ---
+# --- 2. Model CD v6.15 分析引擎 (優化版) ---
 def run_analysis_cd(tickers):
     raw_list = []
-    bar_space = st.empty(); prog = bar_space.progress(0)
+    bar = st.empty(); prog = bar.progress(0)
     for i, t in enumerate(tickers):
         try:
             s = yf.Ticker(t); h = s.history(period="2y").dropna()
-            inf = s.info
-            raw_list.append({"Ticker": t, "Name": inf.get('shortName', t), "PE": inf.get('trailingPE', np.nan), "ROE": inf.get('returnOnEquity', 0), "Margin": inf.get('profitMargins', 0), "Debt": inf.get('debtToEquity', 100), "RevGrow": inf.get('revenueGrowth', 0), "FCF": inf.get('freeCashflow', 0), "Price": h['Close'].iloc[-1], "hist": h})
+            if h.empty: continue
+            try: info = s.info
+            except: info = {}
+            raw_list.append({"Ticker": t, "Name": info.get('shortName', t), "PE": info.get('trailingPE', np.nan), "ROE": info.get('returnOnEquity', 0), "Margin": info.get('profitMargins', 0), "Debt": info.get('debtToEquity', 100), "RevGrow": info.get('revenueGrowth', 0), "FCF": info.get('freeCashflow', 0), "Price": h['Close'].iloc[-1], "hist": h})
+            time.sleep(0.2)
         except: pass
         prog.progress((i + 1) / len(tickers))
-    bar_space.empty()
+    bar.empty()
     if not raw_list: return pd.DataFrame()
     df_r = pd.DataFrame(raw_list)
     v_s, p_s, h_s, g_s = min_max_normalize(df_r['PE'], True), (min_max_normalize(df_r['ROE']) + min_max_normalize(df_r['Margin'])) / 2, (min_max_normalize(df_r['Debt'], True) + df_r['FCF'].apply(lambda x: 100 if x > 0 else 0)) / 2, min_max_normalize(df_r['RevGrow'])
@@ -133,16 +136,15 @@ def run_analysis_cd(tickers):
     for _, r in df_r.iterrows():
         fv = r['F_Score']
         if fv >= 65:
-            h = r['hist']; cp = h['Close'].iloc[-1]; ma50 = h['Close'].rolling(min(len(h), 50)).mean().iloc[-1]
-            ma200 = h['Close'].rolling(min(len(h), 200)).mean().iloc[-1]; atr_v = calculate_atr(h).iloc[-1]
+            h = r['hist']; cp = h['Close'].iloc[-1]; ma200, ma50 = h['Close'].rolling(min(len(h), 200)).mean().iloc[-1], h['Close'].rolling(min(len(h), 50)).mean().iloc[-1]
+            atr_v = calculate_atr(h).iloc[-1]
             ts = (2 if cp > ma200 else 0) + (2 if cp > ma50 else 0) + (2 if h['Volume'].iloc[-1] > h['Volume'].tail(20).mean()*1.5 else 0)
             dec = "✅ 積極買入" if ts >= 6 else ("△ 分批建倉" if ts >= 4 else "⏳ 觀察")
-            buy_p, sl_p, tp_p = ma50, cp - 2*atr_v, cp + 3*atr_v
-        else: ts, dec, buy_p, sl_p, tp_p = "N/A", "X 淘汰", "N/A", "N/A", "N/A"
-        final.append({"Ticker": r['Ticker'], "F_Score": round(fv, 1), "T_Score": ts, "Action": dec, "Price": round(r['Price'], 2), "買入價(50MA)": buy_p, "止損價": sl_p, "止盈價": tp_p})
+            final.append({"Ticker": r['Ticker'], "F_Score": round(fv, 1), "T_Score": ts, "Action": dec, "Price": round(r['Price'], 2), "買入價(50MA)": round(ma50,2), "止損價": round(cp-2*atr_v,2), "止盈價": round(cp+3*atr_v,2)})
+        else:
+            final.append({"Ticker": r['Ticker'], "F_Score": round(fv, 1), "T_Score": "N/A", "Action": "X 淘汰", "Price": round(r['Price'], 2), "買入價(50MA)": "N/A", "止損價": "N/A", "止盈價": "N/A"})
     df_out = pd.DataFrame(final)
-    if df_out.empty: return df_out
-    return df_out.sort_values("F_Score", ascending=False).reset_index(drop=True)
+    return df_out.sort_values("F_Score", ascending=False).reset_index(drop=True) if not df_out.empty else df_out
 
 # --- 側邊欄 ---
 with st.sidebar:
@@ -165,7 +167,6 @@ with st.sidebar:
 st.title("🔬 量化對照實驗室 v6.18 Final Pro")
 col_l, col_r = st.columns(2)
 
-# --- LEFT ---
 with col_l:
     st.subheader("🟢 Strategy Model: 綜合加權分析")
     st.markdown("""<div class="model-info-container"><b>模型詳細說明：</b><br>本模型採用多因子加權評分制，對市場動能與趨勢極為敏感。<br><br><ul><li><b>趨勢 (30%)</b>: 股價相對於50MA的偏離度。回踩支撐 ±2% 得分最高。</li><li><b>估值 (20%)</b>: PEG比率，尋找增長與價格的平衡。</li><li><b>量能 (20%)</b>: 今日相對量(RVOL)與週/月成交趨勢。</li><li><b>指標 (15%)</b>: RSI 強勢區間(45-65)判定。</li><li><b>波動 (15%)</b>: ATR佔比，優先選擇低波動穩健標的。</li></ul><i>*註：ETF模式下估值權重會自動轉移至趨勢(45%)與量能(25%)。</i></div>""", unsafe_allow_html=True)
@@ -190,7 +191,7 @@ with col_l:
             df = yf.download(t, start=datetime.now()-timedelta(days=yr14*365+150), end=datetime.now(), progress=False)
             if not df.empty:
                 df.columns = [c[0] if isinstance(c, tuple) else c for c in df.columns]
-                st.session_state.df_dict_614[t] = {"df": df.dropna(subset=['Close']), "name": yf.Ticker(t).info.get('shortName', t)}
+                st.session_state.df_dict_614[t] = {"df": df.dropna(subset=['Close']), "name": t}
     if st.session_state.df_dict_614:
         sm = []
         for t, data in st.session_state.df_dict_614.items():
@@ -200,14 +201,13 @@ with col_l:
         st.dataframe(style_center_df(pd.DataFrame(sm)), use_container_width=True, hide_index=True, column_config=PERF_COL_CFG)
         st.caption("Remark: 策 = 策略投資法 | 平 = 平衡投資法 (DCA)")
 
-# --- RIGHT ---
 with col_r:
     st.subheader("🔵 Strategy Model: 基本和技術分析")
     st.markdown("""<div class="model-info-container"><b>二階段選股邏輯說明：</b><br>本模型結合基本面深度篩選與技術面強勢擇時，追求高品質交易。<br><br>1. <b>第一階段 (基本面 F-Score)</b>:<br>&nbsp;&nbsp;&nbsp;◦ 計算 估值(30%) + 盈利(35%) + 財務(20%) + 成長(15%)。<br>&nbsp;&nbsp;&nbsp;◦ 門檻：F-Score ≧ 65分合格，未達標則直接淘汰。<br><br>2. <b>第二階段 (技術面 T-Score)</b>:<br>&nbsp;&nbsp;&nbsp;◦ 針對合格股進行技術打分 (滿分 8分)。<br>&nbsp;&nbsp;&nbsp;◦ 包含 200MA位置、均線排列、成交量爆發。<br>&nbsp;&nbsp;&nbsp;◦ 決策：6分以上積極買入 / 4分分批建倉。</div>""", unsafe_allow_html=True)
     if st.button("🚀 執行分析", key="rcd"):
         st.session_state.res_cd = run_analysis_cd(st.session_state.tickers)
     if st.session_state.res_cd is not None:
-        if st.session_state.res_cd.empty: st.warning("無法抓取基本面數據，請稍後再試。")
+        if st.session_state.res_cd.empty: st.warning("無法抓取基本面數據。")
         else:
             d = st.session_state.res_cd.copy(); d.index += 1; d.insert(0, 'Rank', d.index)
             st.dataframe(d.style.set_properties(**{'text-align': 'center'}).map(lambda v: 'background-color: #C6EFCE' if '積極' in str(v) else ('background-color: #FFC7CE' if '淘汰' in str(v) else ''), subset=['Action']), use_container_width=True, hide_index=True)
@@ -225,7 +225,7 @@ with col_r:
             df = yf.download(t, start=datetime.now()-timedelta(days=yrcd*365+150), end=datetime.now(), progress=False)
             if not df.empty:
                 df.columns = [c[0] if isinstance(c, tuple) else c for c in df.columns]
-                st.session_state.df_dict_cd[t] = {"df": df.dropna(subset=['Close']), "name": yf.Ticker(t).info.get('shortName', t)}
+                st.session_state.df_dict_cd[t] = {"df": df.dropna(subset=['Close']), "name": t}
     if st.session_state.df_dict_cd:
         sm_cd = []
         for t, data in st.session_state.df_dict_cd.items():
